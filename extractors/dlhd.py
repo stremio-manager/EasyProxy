@@ -398,6 +398,7 @@ class DLHDExtractor:
             """Estrazione diretta dall'iframe senza passare per la pagina principale."""
             last_error = None
             for iframe_host in hosts_to_try:
+                iframe_host = iframe_host.strip()
                 try:
                     # Se iframe_url è un URL completo, non aggiungere altro
                     if iframe_host.startswith('http'):
@@ -421,6 +422,8 @@ class DLHDExtractor:
                         iframe_url = re.sub(r'id=\d+', f'id={channel_id}', iframe_url)
                         logger.info(f"🔄 Adjusted iframe URL for channel {channel_id}: {iframe_url}")
                     
+                    iframe_url = iframe_url.strip()
+                    
                     embed_headers = {
                         'User-Agent': self.USER_AGENT,
                         'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
@@ -441,7 +444,16 @@ class DLHDExtractor:
                         result = await self._extract_lovecdn_stream(iframe_url, js_content)
                         return result
                     
-                    # Step 2: Extract auth params
+                    # PRIORITY: Try new heuristic flow first (EPlayerAuth / obfuscated)
+                    try:
+                        logger.info("Tentativo prioritario nuovo flusso auth...")
+                        result = await self._extract_new_auth_flow(iframe_url, js_content)
+                        if result:
+                            return result
+                    except Exception as e:
+                        logger.info(f"Nuovo flusso prioritario saltato/fallito: {e}")
+
+                    # Step 2: Extract auth params (OLD FLOW - Fallback)
                     params = {}
                     server_lookup_url = None
                     patterns = {
@@ -462,17 +474,11 @@ class DLHDExtractor:
                     
                     missing_params = [k for k, v in params.items() if not v]
                     if missing_params:
-                        logger.warning(f"⚠️ Missing parameters from {iframe_host}: {missing_params}. Attempting new heuristic flow...")
-                        try:
-                            # Se mancano i parametri standard, prova il nuovo flusso euristico/obfuscated
-                            result = await self._extract_new_auth_flow(iframe_url, js_content)
-                            return result
-                        except Exception as e:
-                            logger.warning(f"⚠️ Nuovo flusso fallito: {e}")
-                            last_error = ExtractorError(f"Missing params: {missing_params} and New Flow failed")
-                            continue
+                        logger.warning(f"⚠️ Old flow missing params: {missing_params}. Since new flow also failed, moving to next host.")
+                        last_error = ExtractorError(f"Both flows failed on {iframe_host}")
+                        continue
                     
-                    logger.info(f"✅ Parameters extracted: channel_key={params['channel_key']}")
+                    logger.info(f"✅ Parameters extracted (Old Flow): channel_key={params['channel_key']}")
                     
                     # Step 3: Auth POST
                     # ✅ DINAMICO: usa self.auth_url completo
@@ -881,13 +887,14 @@ class DLHDExtractor:
         Returns:
             Dict with auth_token, channel_key, channel_salt, server_lookup_url or None
         """
-        # Pattern to extract EPlayerAuth.init block
-        auth_pattern = r"EPlayerAuth\.init\s*\(\s*\{\s*authToken:\s*'([^']+)'"
-        channel_key_pattern = r"channelKey:\s*'([^']+)'"
-        channel_salt_pattern = r"channelSalt:\s*'([^']+)'"
+        # Pattern to extract EPlayerAuth.init block parameters
+        # Relaxed pattern: search for keys anywhere in the content with flexible quotes
+        auth_pattern = r"authToken:\s*['\"]([^'\"]+)['\"]"
+        channel_key_pattern = r"channelKey:\s*['\"]([^'\"]+)['\"]"
+        channel_salt_pattern = r"channelSalt:\s*['\"]([^'\"]+)['\"]"
 
         # Pattern to extract server lookup base URL from fetchWithRetry call
-        lookup_pattern = r"fetchWithRetry\s*\(\s*'([^']+server_lookup\?channel_id=)"
+        lookup_pattern = r"fetchWithRetry\s*\(\s*['\"]([^'\"]+server_lookup\?channel_id=)"
 
         auth_match = re.search(auth_pattern, iframe_html)
         channel_key_match = re.search(channel_key_pattern, iframe_html)
@@ -1017,8 +1024,12 @@ class DLHDExtractor:
         else:
             params['auth_country'] = 'DE'  # Fallback
 
-        # Cerca Timestamp (10 cifre)
+        # Cerca Timestamp (10 cifre) - sia quotato che non (es: timestamp: 1234567890)
         ts_matches = re.findall(r'["\']([0-9]{10})["\']', iframe_content)
+        # Aggiungi ricerca per timestamp numerici non quotati (comuni in EPlayerAuth)
+        ts_numeric = re.findall(r'timestamp:\s*([0-9]{10})', iframe_content)
+        ts_matches.extend(ts_numeric)
+        
         if ts_matches:
             ts_values = sorted([int(x) for x in ts_matches])
             params['auth_ts'] = str(ts_values[0])
